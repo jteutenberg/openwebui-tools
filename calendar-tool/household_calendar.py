@@ -261,14 +261,15 @@ def still_upcoming(start: datetime, end: Optional[datetime], all_day: bool, now:
 
 def format_occurrence(title: str, start: datetime, end: Optional[datetime], all_day: bool) -> str:
     start = start.astimezone(UK_TZ)
+    weekday = start.strftime("%A")
     if all_day:
-        return f"{start:%Y-%m-%d} all-day {title}"
+        return f"{start:%Y-%m-%d} {weekday} all-day {title}"
     if end is None:
-        return f"{start:%Y-%m-%d} {start:%H:%M} {title}"
+        return f"{start:%Y-%m-%d} {weekday} {start:%H:%M} {title}"
     end = end.astimezone(UK_TZ)
     if start.date() == end.date():
-        return f"{start:%Y-%m-%d} {start:%H:%M}-{end:%H:%M} {title}"
-    return f"{start:%Y-%m-%d} {start:%H:%M} to {end:%Y-%m-%d} {end:%H:%M} {title}"
+        return f"{start:%Y-%m-%d} {weekday} {start:%H:%M}-{end:%H:%M} {title}"
+    return f"{start:%Y-%m-%d} {weekday} {start:%H:%M} to {end:%Y-%m-%d} {end:%H:%M} {title}"
 
 
 def expand_recurring(event: dict, range_start_ns: int, range_end_ns: int) -> list[dict]:
