@@ -1,10 +1,10 @@
 """
 title: Household Investments
 author: Family
-description: Summarise household shares and pension. Use when the user asks about investments, shares, savings, or the stock market.
+description: Use how_are_investments for shares, savings, or the stock market. Use how_is_pension for pension. Use list_shares for a breakdown of every holding.
 required_open_webui_version: 0.6.0
 requirements: yfinance
-version: 0.1.0
+version: 0.2.0
 license: MIT
 """
 
@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 UK_TZ = ZoneInfo("Europe/London")
 CACHE_TTL = timedelta(hours=1)
 MOVER_PCT = 3.0
+MAX_LINES = 50
 FX_TICKERS = ("EURGBP=X", "USDGBP=X")
 PENCE = frozenset({"GBp", "GBX"})
 
@@ -39,6 +40,7 @@ class Holding:
     owned: float
     dividends: float
     is_pension: bool
+    purchased: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -48,7 +50,7 @@ class Quote:
     price: float
     prev: float
     week: float
-    year: float
+    ytd: float
 
 
 def now_uk(now: Optional[datetime] = None) -> datetime:
@@ -69,18 +71,20 @@ def load_holdings(path: Path, is_pension: bool) -> list[Holding]:
                 continue
             owned = float(row.get("owned") or 0)
             dividends = 0.0 if is_pension else float(row.get("dividends") or 0)
-            rows.append(Holding(company, ticker, owned, dividends, is_pension))
+            purchased = 0.0 if is_pension else float(row.get("purchased") or 0)
+            rows.append(Holding(company, ticker, owned, dividends, is_pension, purchased))
     return rows
 
 
-def snapshot(closes: list[tuple[date, float]]) -> Optional[tuple[float, float, float, float]]:
+def snapshot(closes: list[tuple[date, float]], as_of: date) -> Optional[tuple[float, float, float, float]]:
     if not closes:
         return None
     closes = sorted(closes, key=lambda item: item[0])
     price = closes[-1][1]
     prev = closes[-2][1] if len(closes) >= 2 else price
     last = closes[-1][0]
-    return price, prev, _on_or_before(closes, last - timedelta(days=7)), _on_or_before(closes, last - timedelta(days=365))
+    year_end = date(as_of.year, 1, 1) - timedelta(days=1)
+    return price, prev, _on_or_before(closes, last - timedelta(days=7)), _on_or_before(closes, year_end)
 
 
 def _on_or_before(closes: list[tuple[date, float]], target: date) -> float:
@@ -129,6 +133,22 @@ def market_value(holdings: list[Holding], quotes: dict[str, Quote], field: str) 
     return total
 
 
+def purchase_cost(holdings: list[Holding], quotes: dict[str, Quote]) -> float:
+    rates = fx_rates(quotes, "price")
+    total = 0.0
+    for holding in holdings:
+        if holding.purchased == 0:
+            continue
+        quote = quotes.get(holding.ticker)
+        if quote is None:
+            continue
+        try:
+            total += holding.owned * to_gbp(holding.purchased, quote.currency, rates)
+        except ValueError:
+            continue
+    return total
+
+
 def missing_tickers(holdings: list[Holding], quotes: dict[str, Quote]) -> list[str]:
     rates_now = fx_rates(quotes, "price")
     missing: list[str] = []
@@ -165,6 +185,22 @@ def pick_movers(holdings: list[Holding], quotes: dict[str, Quote]) -> tuple[str,
     return "Largest mover", [max(scored, key=lambda item: abs(item[1]))]
 
 
+def ranked_values(holdings: list[Holding], quotes: dict[str, Quote]) -> list[tuple[str, float]]:
+    rates = fx_rates(quotes, "price")
+    rows: list[tuple[str, float]] = []
+    for holding in holdings:
+        quote = quotes.get(holding.ticker)
+        if quote is None:
+            continue
+        try:
+            value = holding.owned * to_gbp(quote.price, quote.currency, rates)
+        except ValueError:
+            continue
+        rows.append((holding.company, value))
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    return rows
+
+
 def format_gbp(amount: float) -> str:
     return f"£{amount:,.0f}"
 
@@ -179,27 +215,59 @@ def change_pct(now: float, then: float) -> float:
     return 100.0 * (now / then - 1.0)
 
 
-def render(
-    investment_total: float,
-    dividends: float,
-    combined_total: float,
-    mover_label: str,
-    movers: list[tuple[str, float]],
-    week: float,
-    year: float,
-    missing: list[str],
-) -> str:
-    bits = "; ".join(f"{name} {format_pct(pct)}" for name, pct in movers)
-    lines = [
-        f"Investments: {format_gbp(investment_total)} (includes {format_gbp(dividends)} dividends)",
-        f"Investments + pension: {format_gbp(combined_total)}",
-        f"{mover_label}: {bits or 'none'}",
-        f"Week: {format_pct(week)}",
-        f"Year: {format_pct(year)}",
-    ]
+def format_gain(total: float, cost: float) -> str:
+    if cost == 0:
+        return "n/a"
+    return format_pct(change_pct(total, cost))
+
+
+def with_missing(lines: list[str], missing: list[str]) -> str:
     if missing:
         lines.append("Missing: " + ", ".join(missing))
     return "\n".join(lines)
+
+
+def render_investments(
+    total: float,
+    dividends: float,
+    gain: str,
+    mover_label: str,
+    movers: list[tuple[str, float]],
+    week: float,
+    ytd: float,
+    missing: list[str],
+) -> str:
+    bits = "; ".join(f"{name} {format_pct(pct)}" for name, pct in movers)
+    return with_missing(
+        [
+            f"Investments: {format_gbp(total)} (includes {format_gbp(dividends)} dividends)",
+            f"Gain: {gain}",
+            f"{mover_label}: {bits or 'none'}",
+            f"Week: {format_pct(week)}",
+            f"YTD: {format_pct(ytd)}",
+        ],
+        missing,
+    )
+
+
+def render_pension(total: float, ytd: float, missing: list[str]) -> str:
+    return with_missing(
+        [
+            f"Pension: {format_gbp(total)}",
+            f"YTD: {format_pct(ytd)}",
+        ],
+        missing,
+    )
+
+
+def render_list(rows: list[tuple[str, float]], missing: list[str]) -> str:
+    if not rows and not missing:
+        return "No holdings."
+    lines = [f"{name} {format_gbp(value)}" for name, value in rows]
+    if len(lines) > MAX_LINES:
+        hidden = len(lines) - MAX_LINES
+        lines = lines[:MAX_LINES] + [f"({hidden} more)"]
+    return with_missing(lines, missing)
 
 
 def cache_age(fetched_at: datetime, now: datetime) -> timedelta:
@@ -222,7 +290,7 @@ def read_cache(path: Path) -> Optional[tuple[datetime, dict[str, Quote]]]:
                 price=float(row["price"]),
                 prev=float(row["prev"]),
                 week=float(row["week"]),
-                year=float(row["year"]),
+                ytd=float(row.get("ytd") or row.get("year") or 0),
             )
     if fetched_at is None:
         return None
@@ -232,7 +300,7 @@ def read_cache(path: Path) -> Optional[tuple[datetime, dict[str, Quote]]]:
 def write_cache(path: Path, quotes: dict[str, Quote], fetched_at: datetime) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    fieldnames = ["fetched_at", "ticker", "currency", "price", "prev", "week", "year"]
+    fieldnames = ["fetched_at", "ticker", "currency", "price", "prev", "week", "ytd"]
     with tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -246,7 +314,7 @@ def write_cache(path: Path, quotes: dict[str, Quote], fetched_at: datetime) -> N
                     "price": quote.price,
                     "prev": quote.prev,
                     "week": quote.week,
-                    "year": quote.year,
+                    "ytd": quote.ytd,
                 }
             )
     tmp.replace(path)
@@ -291,6 +359,7 @@ def _currency(ticker: str) -> str:
 def fetch_quotes(tickers: list[str]) -> dict[str, Quote]:
     import yfinance as yf
 
+    as_of = now_uk().date()
     wanted = list(dict.fromkeys([*tickers, *FX_TICKERS]))
     data = yf.download(
         wanted,
@@ -307,7 +376,7 @@ def fetch_quotes(tickers: list[str]) -> dict[str, Quote]:
         series = _closes_from_download(data, ticker)
         if series is None:
             continue
-        points = snapshot(_pairs(series))
+        points = snapshot(_pairs(series), as_of)
         if points is None:
             continue
         currency = "GBP" if ticker.endswith("=X") else _currency(ticker)
@@ -330,7 +399,7 @@ def fetch_quotes(tickers: list[str]) -> dict[str, Quote]:
             series = _closes_from_download(extra, ticker)
             if series is None:
                 continue
-            points = snapshot(_pairs(series))
+            points = snapshot(_pairs(series), as_of)
             if points is None:
                 continue
             quotes[ticker] = Quote(ticker, "GBP", *points)
@@ -343,6 +412,8 @@ def load_quotes(
     now: datetime,
     fetch: FetchFn,
 ) -> dict[str, Quote]:
+    if not tickers:
+        return {}
     cached = read_cache(cache_path)
     needed = set(tickers) | set(FX_TICKERS)
     if cached is not None:
@@ -361,7 +432,80 @@ def load_quotes(
     return quotes
 
 
-def summarise(
+def _needed_quotes(
+    holdings: list[Holding],
+    cache_path: Path,
+    now: datetime,
+    fetch: Optional[FetchFn],
+) -> tuple[Optional[dict[str, Quote]], str]:
+    try:
+        return load_quotes(
+            list(dict.fromkeys(holding.ticker for holding in holdings)),
+            cache_path,
+            now,
+            fetch or fetch_quotes,
+        ), ""
+    except Exception as exc:
+        return None, f"Error: could not fetch prices ({exc})."
+
+
+def _read_file(path: Path, is_pension: bool) -> tuple[Optional[list[Holding]], str]:
+    kind = "pension" if is_pension else "shares"
+    if not path.is_file():
+        return None, f"Error: {kind} file '{path}' not found."
+    return load_holdings(path, is_pension), ""
+
+
+def summarise_investments(
+    shares_path: Path,
+    cache_path: Path,
+    now: Optional[datetime] = None,
+    fetch: Optional[FetchFn] = None,
+) -> str:
+    now = now_uk(now)
+    investments, error = _read_file(shares_path, False)
+    if error:
+        return error
+    quotes, error = _needed_quotes(investments, cache_path, now, fetch)
+    if error:
+        return error
+    dividends = sum(holding.dividends for holding in investments)
+    total = market_value(investments, quotes, "price") + dividends
+    mover_label, movers = pick_movers(investments, quotes)
+    return render_investments(
+        total,
+        dividends,
+        format_gain(total, purchase_cost(investments, quotes)),
+        mover_label,
+        movers,
+        change_pct(market_value(investments, quotes, "price"), market_value(investments, quotes, "week")),
+        change_pct(market_value(investments, quotes, "price"), market_value(investments, quotes, "ytd")),
+        missing_tickers(investments, quotes),
+    )
+
+
+def summarise_pension(
+    pension_path: Path,
+    cache_path: Path,
+    now: Optional[datetime] = None,
+    fetch: Optional[FetchFn] = None,
+) -> str:
+    now = now_uk(now)
+    pensions, error = _read_file(pension_path, True)
+    if error:
+        return error
+    quotes, error = _needed_quotes(pensions, cache_path, now, fetch)
+    if error:
+        return error
+    total = market_value(pensions, quotes, "price")
+    return render_pension(
+        total,
+        change_pct(total, market_value(pensions, quotes, "ytd")),
+        missing_tickers(pensions, quotes),
+    )
+
+
+def summarise_list(
     shares_path: Path,
     pension_path: Path,
     cache_path: Path,
@@ -369,36 +513,17 @@ def summarise(
     fetch: Optional[FetchFn] = None,
 ) -> str:
     now = now_uk(now)
-    if not shares_path.is_file():
-        return f"Error: shares file '{shares_path}' not found."
-    if not pension_path.is_file():
-        return f"Error: pension file '{pension_path}' not found."
-
-    investments = load_holdings(shares_path, is_pension=False)
-    pensions = load_holdings(pension_path, is_pension=True)
+    investments, error = _read_file(shares_path, False)
+    if error:
+        return error
+    pensions, error = _read_file(pension_path, True)
+    if error:
+        return error
     holdings = [*investments, *pensions]
-    tickers = list(dict.fromkeys(holding.ticker for holding in holdings))
-
-    try:
-        quotes = load_quotes(tickers, cache_path, now, fetch or fetch_quotes)
-    except Exception as exc:
-        return f"Error: could not fetch prices ({exc})."
-
-    dividends = sum(holding.dividends for holding in investments)
-    inv_market = market_value(investments, quotes, "price")
-    pension_market = market_value(pensions, quotes, "price")
-    all_now = market_value(holdings, quotes, "price")
-    mover_label, movers = pick_movers(holdings, quotes)
-    return render(
-        inv_market + dividends,
-        dividends,
-        inv_market + dividends + pension_market,
-        mover_label,
-        movers,
-        change_pct(all_now, market_value(holdings, quotes, "week")),
-        change_pct(all_now, market_value(holdings, quotes, "year")),
-        missing_tickers(holdings, quotes),
-    )
+    quotes, error = _needed_quotes(holdings, cache_path, now, fetch)
+    if error:
+        return error
+    return render_list(ranked_values(holdings, quotes), missing_tickers(holdings, quotes))
 
 
 class Tools:
@@ -412,9 +537,21 @@ class Tools:
 
     async def how_are_investments(self) -> str:
         """
-        Summarise investments, pension, movers, and recent change. Call with no arguments.
+        Summarise shares (not pension): total, gain, movers, week, YTD. Use for investments, shares, savings, or the stock market. Call with no arguments.
         """
-        return summarise(
+        return summarise_investments(Path(self.valves.shares_csv), Path(self.valves.cache_csv))
+
+    async def how_is_pension(self) -> str:
+        """
+        Summarise pension total and YTD. Use when the user asks about pension. Call with no arguments.
+        """
+        return summarise_pension(Path(self.valves.pension_csv), Path(self.valves.cache_csv))
+
+    async def list_shares(self) -> str:
+        """
+        List every holding and its current value, highest first. Use for a breakdown or what is held. Call with no arguments.
+        """
+        return summarise_list(
             Path(self.valves.shares_csv),
             Path(self.valves.pension_csv),
             Path(self.valves.cache_csv),
